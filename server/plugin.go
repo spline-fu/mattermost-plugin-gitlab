@@ -17,6 +17,7 @@ import (
 	"github.com/mattermost/mattermost-server/v5/plugin"
 	"github.com/pkg/errors"
 
+	internGitlab "github.com/xanzy/go-gitlab"
 	"golang.org/x/oauth2"
 )
 
@@ -238,44 +239,76 @@ func (p *Plugin) CreateBotDMPost(userID, message, postType string) *model.AppErr
 	return nil
 }
 
+type ToDos struct {
+	unreads           []*internGitlab.Todo
+	yourAssignments   []*internGitlab.Issue
+	reviews           []*internGitlab.MergeRequest
+	yourMergeRequests []*internGitlab.MergeRequest
+}
+
+/// Daily reminder
 func (p *Plugin) PostToDo(info *gitlab.GitlabUserInfo) {
-	text, err := p.GetToDo(info)
+	todo, err := p.GetToDo(info)
 	if err != nil {
 		p.API.LogError("can't post todo", "err", err.Error())
 		return
 	}
+
+	text := p.FormatTodo(&todo)
 
 	if err := p.CreateBotDMPost(info.UserID, text, "custom_git_todo"); err != nil {
 		p.API.LogError("can't create dm post in post todo", "err", err.DetailedError)
 	}
 }
 
-func (p *Plugin) GetToDo(user *gitlab.GitlabUserInfo) (string, error) {
+func (p *Plugin) GetToDo(user *gitlab.GitlabUserInfo) (ToDos, error) {
+	todos := ToDos{}
 	unreads, err := p.GitlabClient.GetUnreads(user)
 	if err != nil {
-		return "", err
+		return todos, err
 	}
+	todos.unreads = unreads
 
 	yourAssignments, err := p.GitlabClient.GetYourAssignments(user)
 	if err != nil {
-		return "", err
+		return todos, err
 	}
+	todos.yourAssignments = yourAssignments
 
 	yourMergeRequests, err := p.GitlabClient.GetYourPrs(user)
 	if err != nil {
-		return "", err
+		return todos, err
 	}
+	todos.yourMergeRequests = yourMergeRequests
 
 	reviews, err := p.GitlabClient.GetReviews(user)
 	if err != nil {
-		return "", err
+		return todos, err
 	}
+	todos.reviews = reviews
 
+	return todos, nil
+}
+
+func (p *Plugin) CheckToDo(t *ToDos) bool {
+	notificationCount := 0
+	notificationContent := ""
+	for _, n := range t.unreads {
+		if p.isNamespaceAllowed(n.Project.NameWithNamespace) != nil {
+			continue
+		}
+		notificationCount++
+		notificationContent += fmt.Sprintf("* %v : [%v](%v)\n", n.ActionName, n.Target.Title, n.TargetURL)
+	}
+	return (notificationCount == 0) || (len(t.reviews) == 0) || (len(t.yourAssignments) == 0) || (len(t.yourMergeRequests) == 0)
+}
+
+func (p *Plugin) FormatTodo(t *ToDos) string {
 	text := "##### Unread Messages\n"
 
 	notificationCount := 0
 	notificationContent := ""
-	for _, n := range unreads {
+	for _, n := range t.unreads {
 		if p.isNamespaceAllowed(n.Project.NameWithNamespace) != nil {
 			continue
 		}
@@ -292,41 +325,41 @@ func (p *Plugin) GetToDo(user *gitlab.GitlabUserInfo) (string, error) {
 
 	text += "##### Review Requests\n"
 
-	if len(reviews) == 0 {
+	if len(t.reviews) == 0 {
 		text += "You don't have any merge requests awaiting your review.\n"
 	} else {
-		text += fmt.Sprintf("You have %v merge requests awaiting your review:\n", len(reviews))
+		text += fmt.Sprintf("You have %v merge requests awaiting your review:\n", len(t.reviews))
 
-		for _, pr := range reviews {
+		for _, pr := range t.reviews {
 			text += fmt.Sprintf("* [%v](%v)\n", pr.Title, pr.WebURL)
 		}
 	}
 
 	text += "##### Assignments\n"
 
-	if len(yourAssignments) == 0 {
+	if len(t.yourAssignments) == 0 {
 		text += "You don't have any issues awaiting your dev.\n"
 	} else {
-		text += fmt.Sprintf("You have %v issues awaiting dev:\n", len(yourAssignments))
+		text += fmt.Sprintf("You have %v issues awaiting dev:\n", len(t.yourAssignments))
 
-		for _, pr := range yourAssignments {
+		for _, pr := range t.yourAssignments {
 			text += fmt.Sprintf("* [%v](%v)\n", pr.Title, pr.WebURL)
 		}
 	}
 
 	text += "##### Your Open Merge Requests\n"
 
-	if len(yourMergeRequests) == 0 {
+	if len(t.yourMergeRequests) == 0 {
 		text += "You don't have any open merge requests.\n"
 	} else {
-		text += fmt.Sprintf("You have %v open merge requests:\n", len(yourMergeRequests))
+		text += fmt.Sprintf("You have %v open merge requests:\n", len(t.yourMergeRequests))
 
-		for _, pr := range yourMergeRequests {
+		for _, pr := range t.yourMergeRequests {
 			text += fmt.Sprintf("* [%v](%v)\n", pr.Title, pr.WebURL)
 		}
 	}
 
-	return text, nil
+	return text
 }
 
 func (p *Plugin) isNamespaceAllowed(namespace string) error {
